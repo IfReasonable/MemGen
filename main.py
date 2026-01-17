@@ -213,7 +213,9 @@ def main():
     _patch_deepspeed_zero2_used_param_counter()
 
     # Enforce strict loading rules for full MemGen evaluation and trigger training.
-    if config.run_cfg.mode == "evaluate":
+    eval_vanilla = bool(getattr(config.run_cfg, "eval_vanilla", False))
+    if config.run_cfg.mode == "evaluate" and not eval_vanilla:
+        # Default behavior: evaluation expects a full MemGen checkpoint (weaver+trigger extras).
         config.model_cfg.require_full_memgen = True
         config.model_cfg.strict_load_weaver = True
         config.model_cfg.strict_load_trigger = True
