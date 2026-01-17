@@ -2,12 +2,20 @@
 
 export DEBUG_MODE=true  
 export LOG_PATH="./debug_log_2b.txt"
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES="0"
 export MAIN_PROCESS_PORT=29507
 export NCCL_DEBUG=INFO
 export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=1
 export NCCL_ASYNC_DISABLE=1
+
+# Derive process count from CUDA_VISIBLE_DEVICES (e.g. "1,2,3" -> 3).
+# This avoids being limited by configs/zero2.yaml's num_processes.
+if [[ -n "${CUDA_VISIBLE_DEVICES}" ]]; then
+    NUM_PROCESSES=$(echo "${CUDA_VISIBLE_DEVICES}" | awk -F',' '{print NF}')
+else
+    NUM_PROCESSES=1
+fi
 
 # options:
 # - Qwen/Qwen2.5-1.5B-Instruct
@@ -32,13 +40,19 @@ PROMPT_LATENTS_LEN=16
 INFERENCE_LATENTS_LEN=8
 
 # Trained model path: 
-# - Must point to a checkpoint file ending with .safetensors (e.g. <output_dir>/model.safetensors)
-# - Required when evaluating the model
+# - Must point to a checkpoint file ending with .safetensors (e.g. <run_dir>/weaver/model.safetensors
+#   or <run_dir>/trigger/model.safetensors).
+# - If you trained Weaver only: set to the Weaver checkpoint.
+# - If you trained Trigger (usually after loading Weaver): set to the Trigger checkpoint.
+#   (It contains BOTH weaver+trigger extra weights, but not the base LLM.)
+# - Required when evaluating the model.
 LOAD_MODEL_PATH=null
 
 # evaluate
 python -m accelerate.commands.launch \
     --config_file=configs/zero2.yaml \
+    --num_processes ${NUM_PROCESSES} \
+    --main_process_port ${MAIN_PROCESS_PORT} \
     main.py \
     --cfg-path configs/latent_memory/${DATASET_NAME}.yaml \
     --options \

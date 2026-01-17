@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Union, Optional
 
 import random
@@ -23,6 +24,7 @@ from memgen.model.weaver import MemGenWeaver
 from memgen.utils import (
     CONVERSATION_TEMPLATE,
     fix_model_parameters,
+    load_state_dict_from_safetensor,
 )
 
 class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin):
@@ -362,6 +364,20 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
+        # DeepSpeed ZeRO stage 1/2 can crash while counting used parameters in backward when
+        # some trainable parameters are not part of the autograd graph for a given step.
+        # This can happen in MemGen when a sample yields zero augmentation points, so the
+        # weaver/projection trainable params are effectively unused for that batch.
+        # Touching every trainable parameter with a zero-scaled term keeps the graph connected
+        # without changing the loss value.
+        dummy = None
+        for p in self.parameters():
+            if getattr(p, "requires_grad", False):
+                v = p.reshape(-1)[0]
+                dummy = v if dummy is None else (dummy + v)
+        if dummy is not None:
+            loss = loss + dummy * 0.0
+
         # Return model outputs
         outputs = MemGenOutputWithPast(loss=loss, logits=all_logits)
         outputs.supervised_labels = all_labels  # Positions in input_ids that are supervised
@@ -550,6 +566,8 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
     def from_config(cls, config_dict: dict):
         # base LLM
         model_name = config_dict.get("model_name")
+        if not model_name:
+            raise ValueError("`model.model_name` must be provided in config")
 
         # max augment numbers
         max_prompt_aug_num = config_dict.get("max_prompt_aug_num", 1)
@@ -569,8 +587,6 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
         trigger_model_name = trigger_config.get("model_name", None)
 
         # 构造 MemGenConfig
-        from transformers import AutoConfig
-        memgen_config = AutoConfig.from_pretrained(model_name)
         memgen_config = MemGenConfig.from_pretrained(
             model_name, 
 
@@ -584,38 +600,189 @@ class MemGenModel(PreTrainedModel, MemGenLoraSwitchMixin, MemGenGenerationMixin)
             trigger_active=trigger_active,
             trigger_lora_config=trigger_lora_config_dict
         )
-        
-        base_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+
+        def _can_use_flash_attn() -> bool:
+            try:
+                import flash_attn  # noqa: F401
+                return True
+            except Exception:
+                return False
+
+        def _load_causal_lm(pretrained_name_or_path: str):
+            attn_impl_candidates = []
+            if _can_use_flash_attn():
+                attn_impl_candidates.append("flash_attention_2")
+            attn_impl_candidates.extend(["sdpa", "eager"])
+
+            last_err: Exception | None = None
+            for attn_impl in attn_impl_candidates:
+                try:
+                    return AutoModelForCausalLM.from_pretrained(
+                        pretrained_name_or_path,
+                        torch_dtype=torch.bfloat16,
+                        attn_implementation=attn_impl,
+                    )
+                except Exception as err:
+                    last_err = err
+                    continue
+            if last_err is None:
+                raise RuntimeError("Failed to load model; no attention implementation candidates were tried")
+            raise last_err
+
+        base_model = _load_causal_lm(model_name)
         base_tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+        weaver_model_name = weaver_model_name or model_name
+        trigger_model_name = trigger_model_name or model_name
+
         if weaver_model_name != model_name:
-            weaver_model = AutoModelForCausalLM.from_pretrained(weaver_model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+            weaver_model = _load_causal_lm(weaver_model_name)
         else:
             weaver_model = base_model
-        
+
         if trigger_model_name != model_name:
-            trigger_model = AutoModelForCausalLM.from_pretrained(trigger_model_name, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+            trigger_model = _load_causal_lm(trigger_model_name)
         else:
             trigger_model = base_model
         
         load_model_path = config_dict.get("load_model_path", None)
-        if not load_model_path:
-            model = cls(
-                config=memgen_config, 
-                base_model=base_model, 
-                base_tokenizer=base_tokenizer,
-                weaver_model=weaver_model,
-                trigger_model=trigger_model
+        strict_load_weaver = bool(config_dict.get("strict_load_weaver", False))
+        strict_load_trigger = bool(config_dict.get("strict_load_trigger", False))
+        require_full_memgen = bool(config_dict.get("require_full_memgen", False))
+        if require_full_memgen:
+            strict_load_weaver = True
+            strict_load_trigger = True
+
+        # Always initialize the model from the base pretrained weights first.
+        # Then (optionally) load extra weights from `load_model_path` with strict=False.
+        # This makes it compatible with checkpoints that save only trainable params.
+        model = cls(
+            config=memgen_config,
+            base_model=base_model,
+            base_tokenizer=base_tokenizer,
+            weaver_model=weaver_model,
+            trigger_model=trigger_model,
+        )
+
+        if (strict_load_weaver or strict_load_trigger) and not load_model_path:
+            raise ValueError(
+                "Strict MemGen load requested but `model.load_model_path` is empty. "
+                "Provide a checkpoint that includes the required MemGen weights."
             )
-        else:
-            model = cls.from_pretrained(
-                load_model_path, 
-                config=memgen_config,
-                base_model=base_model,
-                base_tokenizer=base_tokenizer,
-                weaver_model=weaver_model,
-                trigger_model=trigger_model
-            )
+
+        if load_model_path:
+            resolved_path = os.path.expanduser(str(load_model_path))
+
+            # Accept either a single safetensors file or a directory that contains one.
+            state_path: str | None = None
+            if os.path.isfile(resolved_path) and resolved_path.endswith(".safetensors"):
+                state_path = resolved_path
+            elif os.path.isdir(resolved_path):
+                candidate = os.path.join(resolved_path, "model.safetensors")
+                if os.path.isfile(candidate):
+                    state_path = candidate
+
+            if state_path is not None:
+                logging.info(f"Loading weights from safetensors: {state_path}")
+                state_dict = load_state_dict_from_safetensor(state_path)
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                if missing:
+                    logging.info(f"Missing keys when loading (expected for partial checkpoints): {len(missing)}")
+                if unexpected:
+                    logging.warning(f"Unexpected keys when loading: {len(unexpected)}")
+
+                def _is_weaver_key(key: str) -> bool:
+                    return (
+                        key.startswith(("weaver.", "reasoner_to_weaver.", "weaver_to_reasoner."))
+                        or ".weaver" in key
+                    )
+
+                def _is_trigger_key(key: str) -> bool:
+                    return key.startswith("trigger.") or ".trigger" in key
+
+                if strict_load_weaver:
+                    if not any(_is_weaver_key(k) for k in state_dict.keys()):
+                        raise RuntimeError(
+                            "Strict weaver load requested, but no weaver weights found in checkpoint."
+                        )
+
+                    # A MemGen checkpoint is allowed to be *partial* (extra weights only).
+                    # In that case, `missing` will contain lots of base-model keys which are
+                    # expected because the base pretrained weights are loaded separately.
+                    # What we must guarantee in strict mode is: all trainable MemGen extra
+                    # weights (weaver LoRA/latents/connectors) are present in the checkpoint.
+                    state_keys = set(state_dict.keys())
+                    model_state_keys = set(model.state_dict().keys())
+
+                    def _is_weaver_backbone_key(key: str) -> bool:
+                        # Base LM weights inside the weaver wrapper; not required in partial ckpts.
+                        return key.startswith("weaver.model.base_model.")
+
+                    required_weaver: set[str] = set()
+
+                    # Always-required MemGen connector weights if present.
+                    for k in model_state_keys:
+                        if k.startswith(("reasoner_to_weaver.", "weaver_to_reasoner.")):
+                            required_weaver.add(k)
+
+                    # Latent parameters (if present in this model variant).
+                    for k in ("weaver.prompt_query_latents", "weaver.inference_query_latents"):
+                        if k in model_state_keys:
+                            required_weaver.add(k)
+
+                    # All trainable weaver-related parameters (e.g. LoRA adapters).
+                    for name, param in model.named_parameters():
+                        if not getattr(param, "requires_grad", False):
+                            continue
+                        if not _is_weaver_key(name):
+                            continue
+                        if _is_trigger_key(name):
+                            continue
+                        if _is_weaver_backbone_key(name):
+                            continue
+                        required_weaver.add(name)
+
+                    missing_required_weaver = sorted(required_weaver - state_keys)
+                    if missing_required_weaver:
+                        preview = ", ".join(missing_required_weaver[:20])
+                        raise RuntimeError(
+                            "Strict weaver load failed: checkpoint is missing required MemGen weaver weights: "
+                            f"{len(missing_required_weaver)} (e.g., {preview})"
+                        )
+
+                if strict_load_trigger:
+                    if not any(_is_trigger_key(k) for k in state_dict.keys()):
+                        raise RuntimeError(
+                            "Strict trigger load requested, but no trigger weights found in checkpoint."
+                        )
+
+                    state_keys = set(state_dict.keys())
+                    required_trigger: set[str] = set()
+                    for name, param in model.named_parameters():
+                        if not getattr(param, "requires_grad", False):
+                            continue
+                        if _is_trigger_key(name):
+                            required_trigger.add(name)
+
+                    missing_required_trigger = sorted(required_trigger - state_keys)
+                    if missing_required_trigger:
+                        preview = ", ".join(missing_required_trigger[:20])
+                        raise RuntimeError(
+                            "Strict trigger load failed: checkpoint is missing required MemGen trigger weights: "
+                            f"{len(missing_required_trigger)} (e.g., {preview})"
+                        )
+            else:
+                # Fallback to HF-style directory checkpoints (must include config + weights).
+                # This keeps backward compatibility if a full `save_pretrained` directory is given.
+                logging.info(f"Loading HF checkpoint directory: {resolved_path}")
+                model = cls.from_pretrained(
+                    resolved_path,
+                    config=memgen_config,
+                    base_model=base_model,
+                    base_tokenizer=base_tokenizer,
+                    weaver_model=weaver_model,
+                    trigger_model=trigger_model,
+                )
         
         return model
 

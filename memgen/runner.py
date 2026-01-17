@@ -1,5 +1,7 @@
 import os
+import logging
 import random
+import time
 
 from accelerate import Accelerator
 from datasets import Dataset
@@ -26,6 +28,7 @@ from memgen.trainer.trigger_grpo_trainer import TriggerGRPOTrainer
 from memgen.utils import (
     StaticEvalRecorder,
     DynamicEvalRecorder,
+    write_global_eval_summary,
     create_tensorboard,
     remove_trainer_checkpoints,
     log_trainable_params,
@@ -160,11 +163,15 @@ class MemGenRunner:
         # train weaver
         weaver_trainer = self._create_weaver_trainer()
         weaver_trainer.train()
-        weaver_trainer.save_model()   # save the best model
-        
-        # remove checkpoints and save weaver
+
+        # Save the best/final model.
+        # NOTE: Under multi-GPU DeepSpeed, saving a full 1.5B base model can be extremely slow and
+        # looks like a hang (GPU util stays high). Here we save only trainable parameters.
         output_dir = weaver_trainer.args.output_dir
-        remove_trainer_checkpoints(output_dir)
+        self._save_trainable_model_artifacts(weaver_trainer, output_dir)
+        
+        # remove checkpoints
+        self._remove_trainer_checkpoints_safely(weaver_trainer, output_dir)
     
     
     # ===== train trigger =====
@@ -194,11 +201,160 @@ class MemGenRunner:
         # train trigger
         trigger_trainer = self._create_trigger_trainer()
         trigger_trainer.train()
-        trigger_trainer.save_model()     # save the best model
 
-        # remove checkpoints and save weaver
         output_dir = trigger_trainer.args.output_dir
-        remove_trainer_checkpoints(output_dir)
+        # Trigger training usually starts from a trained weaver checkpoint.
+        # Save BOTH weaver+trigger extra weights (but not the base LLM) so eval can
+        # load a single `trigger/model.safetensors`.
+        self._save_memgen_extra_model_artifacts(
+            trigger_trainer,
+            output_dir,
+            include_weaver=True,
+            include_trigger=True,
+        )
+        self._remove_trainer_checkpoints_safely(trigger_trainer, output_dir)
+
+    def _is_distributed(self) -> bool:
+        try:
+            return int(os.environ.get("WORLD_SIZE", "1")) > 1
+        except Exception:
+            return False
+
+    def _is_rank0(self) -> bool:
+        # accelerate sets RANK/WORLD_SIZE; torchrun sets LOCAL_RANK/RANK.
+        try:
+            return int(os.environ.get("RANK", "0")) == 0
+        except Exception:
+            return True
+
+    def _trainer_wait_for_everyone(self, trainer) -> None:
+        acc = getattr(trainer, "accelerator", None)
+        if acc is not None:
+            acc.wait_for_everyone()
+
+    def _save_trainable_model_artifacts(self, trainer, output_dir: str) -> None:
+        """Save a lightweight checkpoint for inference.
+
+        We intentionally save only trainable parameters to avoid long/full-model saves under
+        DeepSpeed multi-GPU training.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        is_rank0 = getattr(trainer, "is_world_process_zero", None)
+        is_rank0 = is_rank0() if callable(is_rank0) else self._is_rank0()
+
+        self._trainer_wait_for_everyone(trainer)
+        if is_rank0:
+            start = time.time()
+            logging.info(f"Saving trainable weights to {output_dir} ...")
+
+            # Build a filtered state_dict containing only trainable parameters.
+            trainable_param_names = {
+                name for name, param in self.model.named_parameters() if getattr(param, "requires_grad", False)
+            }
+            full_state_dict = self.model.state_dict()
+            trainable_state_dict = {k: v.detach().cpu() for k, v in full_state_dict.items() if k in trainable_param_names}
+
+            # Save model + tokenizer in HF format; will create config.json and model.safetensors.
+            self.model.save_pretrained(output_dir, state_dict=trainable_state_dict, safe_serialization=True)
+            try:
+                self.processing_class.save_pretrained(output_dir)
+            except Exception:
+                # Tokenizer saving is non-critical for training completion.
+                logging.exception("Failed to save tokenizer; continuing.")
+
+            elapsed = time.time() - start
+            logging.info(f"Saved trainable weights to {output_dir} in {elapsed:.2f}s")
+
+        # IMPORTANT: all ranks must participate in the post-save barrier,
+        # otherwise rank0 can hang forever waiting for others.
+        self._trainer_wait_for_everyone(trainer)
+
+    def _save_memgen_extra_model_artifacts(
+        self,
+        trainer,
+        output_dir: str,
+        include_weaver: bool,
+        include_trigger: bool,
+    ) -> None:
+        """Save a compact checkpoint containing MemGen extra weights only.
+
+        This excludes the base LLM weights and keeps eval compatible by relying on
+        `load_state_dict(..., strict=False)`.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        is_rank0 = getattr(trainer, "is_world_process_zero", None)
+        is_rank0 = is_rank0() if callable(is_rank0) else self._is_rank0()
+
+        self._trainer_wait_for_everyone(trainer)
+        if is_rank0:
+            start = time.time()
+            logging.info(
+                f"Saving MemGen extra weights (weaver={include_weaver}, trigger={include_trigger}) to {output_dir} ..."
+            )
+
+            trainable_param_names = {
+                name for name, param in self.model.named_parameters() if getattr(param, "requires_grad", False)
+            }
+
+            full_state_dict = self.model.state_dict()
+            extra_state_dict = {}
+
+            always_prefixes = (
+                "reasoner_to_weaver.",
+                "weaver_to_reasoner.",
+            )
+
+            def _want_key(key: str) -> bool:
+                if key.startswith(always_prefixes):
+                    return True
+
+                # Safety net: include any currently-trainable params.
+                if key in trainable_param_names:
+                    return True
+
+                if include_weaver:
+                    if key in ("weaver.prompt_query_latents", "weaver.inference_query_latents"):
+                        return True
+                    # LoRA adapter params for the weaver adapter.
+                    if "lora_" in key and ".weaver" in key:
+                        return True
+
+                if include_trigger:
+                    if key.startswith("trigger.output_layer."):
+                        return True
+                    # LoRA adapter params for the trigger adapter.
+                    if "lora_" in key and ".trigger" in key:
+                        return True
+
+                return False
+
+            for k, v in full_state_dict.items():
+                if _want_key(k):
+                    extra_state_dict[k] = v.detach().cpu()
+
+            self.model.save_pretrained(output_dir, state_dict=extra_state_dict, safe_serialization=True)
+            try:
+                self.processing_class.save_pretrained(output_dir)
+            except Exception:
+                logging.exception("Failed to save tokenizer; continuing.")
+
+            elapsed = time.time() - start
+            logging.info(
+                f"Saved MemGen extra weights to {output_dir} ({len(extra_state_dict)} tensors) in {elapsed:.2f}s"
+            )
+
+        # IMPORTANT: all ranks must participate in the post-save barrier.
+        self._trainer_wait_for_everyone(trainer)
+
+    def _remove_trainer_checkpoints_safely(self, trainer, output_dir: str) -> None:
+        is_rank0 = getattr(trainer, "is_world_process_zero", None)
+        is_rank0 = is_rank0() if callable(is_rank0) else self._is_rank0()
+        self._trainer_wait_for_everyone(trainer)
+        if is_rank0:
+            remove_trainer_checkpoints(output_dir)
+        self._trainer_wait_for_everyone(trainer)
 
     
     # ===== train weaver/trigger =====
@@ -249,7 +405,12 @@ class MemGenRunner:
         
         # construct eval recorder
         test_funcs = [self.env_cls.compute_reward]
-        save_file = os.path.join(output_dir, "answer.json")
+        # Under multi-process evaluation, each rank sees a shard of the dataset.
+        # Write per-rank shards to avoid file corruption / multiple summary lines.
+        if accelerator.num_processes > 1:
+            save_file = os.path.join(output_dir, f"answer_rank{accelerator.process_index}.jsonl")
+        else:
+            save_file = os.path.join(output_dir, "answer.json")
         recorder = StaticEvalRecorder(compute_metrics=test_funcs, writer=writer, log_file=save_file)
         
         # batch generation
@@ -275,8 +436,31 @@ class MemGenRunner:
                 completion_ids = gen_output.batch["responses"]
                 completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
-            recorder.record_batch(completions, test_batch)
+            # Token stats for offline analysis / reporting.
+            prompt_token_lens = prompt_mask.detach().cpu().sum(dim=1).tolist()
+            pad_id = self.processing_class.pad_token_id
+            if pad_id is None:
+                completion_token_lens = [int(x.shape[0]) for x in completion_ids.detach().cpu()]
+            else:
+                completion_token_lens = (
+                    completion_ids.detach().cpu().ne(pad_id).sum(dim=1).tolist()
+                )
+
+            recorder.record_batch(
+                completions,
+                test_batch,
+                prompt_token_lens=prompt_token_lens,
+                completion_token_lens=completion_token_lens,
+            )
         recorder.finalize()
+
+        # Write one global summary (metrics + token stats) across ranks.
+        write_global_eval_summary(
+            accelerator=accelerator,
+            output_dir=output_dir,
+            local_totals=recorder.get_local_totals(),
+            filename="eval_summary.json",
+        )
         writer.close()
 
 
@@ -373,6 +557,15 @@ class MemGenRunner:
         self.weaver_sft_training_args = SFTConfig(**weaver_sft_config)
         self.weaver_sft_training_args.output_dir = os.path.join(self.working_dir, "weaver")
 
+        # DeepSpeed multi-GPU + load_best_model_at_end can trigger a long (or occasionally stuck)
+        # best-checkpoint reload after the progress bar reaches 100%.
+        if self._is_distributed() and getattr(self.weaver_sft_training_args, "load_best_model_at_end", False):
+            logging.warning(
+                "Detected distributed training (WORLD_SIZE>1). Disabling weaver SFT load_best_model_at_end "
+                "to avoid long post-train checkpoint reloads under DeepSpeed."
+            )
+            self.weaver_sft_training_args.load_best_model_at_end = False
+
         # parse weaver grpo training args
         weaver_grpo_config = weaver_config.get("grpo", dict())
         self.weaver_grpo_training_args = GRPOConfig(**weaver_grpo_config)
@@ -387,6 +580,14 @@ class MemGenRunner:
         trigger_grpo_config = trigger_config.get("grpo", dict())
         self.trigger_grpo_training_args = GRPOConfig(**trigger_grpo_config)
         self.trigger_grpo_training_args.output_dir = os.path.join(self.working_dir, "trigger")
+
+        # Trigger GRPO: disable full intermediate checkpoints. We'll save a compact
+        # extra-weights checkpoint ourselves after training.
+        self.trigger_grpo_training_args.save_strategy = "no"
+        if hasattr(self.trigger_grpo_training_args, "save_steps"):
+            self.trigger_grpo_training_args.save_steps = 0
+        if hasattr(self.trigger_grpo_training_args, "load_best_model_at_end"):
+            self.trigger_grpo_training_args.load_best_model_at_end = False
 
         # --- parse interaction args ---
         interaction_configs = configs.get("interaction", {})

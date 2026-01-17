@@ -45,7 +45,8 @@ We follow a two-stage training approach, training each module separately.
     ```
 
 - **Evaluate the Weaver model**  
-    Before running, make sure to update `LOAD_MODEL_PATH` in `eval.sh` to point to the trained checkpoint: `<weaver_dir>`
+    Before running, update `LOAD_MODEL_PATH` in `eval.sh` to point to the trained checkpoint file:
+    `<run_dir>/weaver/model.safetensors`
     ```bash
     bash eval.sh
     ```
@@ -56,7 +57,9 @@ We follow a two-stage training approach, training each module separately.
     bash trigger_train.sh
     ```
 - **Evaluate the Trigger model**  
-    Before running, make sure to update `LOAD_MODEL_PATH` in `eval.sh` to point to the trained checkpoint: `<trigger_dir>`
+ - **Evaluate the Trigger model**  
+    Before running, update `LOAD_MODEL_PATH` in `eval.sh` to point to the trained checkpoint file:
+    `<run_dir>/trigger/model.safetensors`
     ```bash
     bash eval.sh
     ```

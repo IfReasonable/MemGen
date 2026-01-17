@@ -23,6 +23,17 @@ from transformers import (
 )
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_flash_attn_2_available, is_peft_available, is_rich_available
+
+# Disable vLLM in TRL if installed but incompatible (missing StatelessProcessGroup).
+try:
+    from vllm.distributed.utils import StatelessProcessGroup as _StatelessProcessGroup  # noqa: F401
+except Exception:
+    try:
+        import trl.import_utils as _trl_import_utils
+        _trl_import_utils._vllm_available = False
+    except Exception:
+        pass
+
 from trl import GRPOTrainer, GRPOConfig
 from trl.trainer.utils import selective_log_softmax
 from trl.data_utils import maybe_apply_chat_template, is_conversational 

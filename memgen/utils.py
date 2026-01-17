@@ -4,9 +4,10 @@ import json
 import logging
 import os
 import shutil
-from typing import Optional, Callable, Dict, List
+from typing import Optional, Callable, Dict, List, Any
 
 from safetensors import safe_open
+import torch
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 
@@ -92,16 +93,28 @@ class StaticEvalRecorder:
     # Internal storage
     metric_sums: Dict[str, float] = field(init=False)
     metric_counts: Dict[str, int] = field(init=False)
+    _prompt_tokens_sum: int = field(init=False, default=0)
+    _completion_tokens_sum: int = field(init=False, default=0)
+    _example_count: int = field(init=False, default=0)
 
     def __post_init__(self):
         self.metric_sums = {metric.__name__: 0.0 for metric in self.compute_metrics}
         self.metric_counts = {metric.__name__: 0 for metric in self.compute_metrics}
+        self._prompt_tokens_sum = 0
+        self._completion_tokens_sum = 0
+        self._example_count = 0
         if self.log_file:
             os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
             with open(self.log_file, 'w') as f:
                 f.write('')  # Clear file
 
-    def record_batch(self, completions: List[str], examples: List[Dict]):
+    def record_batch(
+        self,
+        completions: List[str],
+        examples: List[Dict],
+        prompt_token_lens: Optional[List[int]] = None,
+        completion_token_lens: Optional[List[int]] = None,
+    ):
         """Record results for a batch of model outputs.
 
         Args:
@@ -145,6 +158,18 @@ class StaticEvalRecorder:
                 'metrics': metrics_result
             }
 
+            if prompt_token_lens is not None and completion_token_lens is not None:
+                p_len = int(prompt_token_lens[i])
+                c_len = int(completion_token_lens[i])
+                record['token_stats'] = {
+                    'prompt_tokens': p_len,
+                    'completion_tokens': c_len,
+                    'total_tokens': p_len + c_len,
+                }
+                self._prompt_tokens_sum += p_len
+                self._completion_tokens_sum += c_len
+                self._example_count += 1
+
             # Write the record into a log file (if available)
             if self.log_file:
                 with open(self.log_file, 'a') as f:
@@ -169,6 +194,17 @@ class StaticEvalRecorder:
             'summary_metrics': mean_metrics
         }
 
+        if self._example_count > 0:
+            final_record['summary_tokens'] = {
+                'num_examples': self._example_count,
+                'prompt_tokens_total': self._prompt_tokens_sum,
+                'completion_tokens_total': self._completion_tokens_sum,
+                'total_tokens_total': self._prompt_tokens_sum + self._completion_tokens_sum,
+                'prompt_tokens_mean': self._prompt_tokens_sum / self._example_count,
+                'completion_tokens_mean': self._completion_tokens_sum / self._example_count,
+                'total_tokens_mean': (self._prompt_tokens_sum + self._completion_tokens_sum) / self._example_count,
+            }
+
         if self.log_file:
             with open(self.log_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(final_record, ensure_ascii=False) + '\n')
@@ -177,6 +213,107 @@ class StaticEvalRecorder:
             mean_metrics = self.get_mean_metrics()
             for name, value in mean_metrics.items():
                 self.writer.add_scalar(name + "_final", value, global_step=self.metric_counts[name])
+
+    def get_local_totals(self) -> Dict[str, Any]:
+        """Return local (per-process) totals for global aggregation."""
+        return {
+            "metric_sums": dict(self.metric_sums),
+            "metric_counts": dict(self.metric_counts),
+            "prompt_tokens_sum": int(self._prompt_tokens_sum),
+            "completion_tokens_sum": int(self._completion_tokens_sum),
+            "example_count": int(self._example_count),
+        }
+
+
+def write_global_eval_summary(
+    *,
+    accelerator,
+    output_dir: str,
+    local_totals: Dict[str, Any],
+    filename: str = "eval_summary.json",
+    extra: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Aggregate eval performance + token statistics across all ranks and write one JSON.
+
+    This is designed to be safe under multi-process runs:
+    - Every rank calls it
+    - Rank0 writes a single `${output_dir}/${filename}` containing GLOBAL totals/means
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    num_processes = int(getattr(accelerator, "num_processes", 1) or 1)
+    if num_processes > 1:
+        if hasattr(accelerator, "gather_object"):
+            gathered = accelerator.gather_object(local_totals)
+        else:
+            # Older accelerate versions don't expose gather_object on Accelerator.
+            # Use torch.distributed directly.
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                gathered = [None] * torch.distributed.get_world_size()
+                torch.distributed.all_gather_object(gathered, local_totals)
+            else:
+                gathered = [local_totals]
+    else:
+        gathered = [local_totals]
+
+    is_main = bool(getattr(accelerator, "is_main_process", False)) if hasattr(accelerator, "is_main_process") else (
+        int(getattr(accelerator, "process_index", 0) or 0) == 0
+    )
+
+    if is_main:
+        metric_sums: Dict[str, float] = {}
+        metric_counts: Dict[str, int] = {}
+        prompt_tokens_total = 0
+        completion_tokens_total = 0
+        example_total = 0
+
+        for t in gathered:
+            for k, v in (t.get("metric_sums") or {}).items():
+                metric_sums[k] = metric_sums.get(k, 0.0) + float(v)
+            for k, v in (t.get("metric_counts") or {}).items():
+                metric_counts[k] = metric_counts.get(k, 0) + int(v)
+            prompt_tokens_total += int(t.get("prompt_tokens_sum") or 0)
+            completion_tokens_total += int(t.get("completion_tokens_sum") or 0)
+            example_total += int(t.get("example_count") or 0)
+
+        summary_metrics: Dict[str, float] = {}
+        for k, s in metric_sums.items():
+            c = metric_counts.get(k, 0)
+            summary_metrics[k] = (s / c) if c > 0 else 0.0
+
+        summary_tokens: Dict[str, Any] = {
+            "num_examples": example_total,
+            "prompt_tokens_total": prompt_tokens_total,
+            "completion_tokens_total": completion_tokens_total,
+            "total_tokens_total": prompt_tokens_total + completion_tokens_total,
+        }
+        if example_total > 0:
+            summary_tokens.update(
+                {
+                    "prompt_tokens_mean": prompt_tokens_total / example_total,
+                    "completion_tokens_mean": completion_tokens_total / example_total,
+                    "total_tokens_mean": (prompt_tokens_total + completion_tokens_total) / example_total,
+                }
+            )
+
+        payload: Dict[str, Any] = {
+            "summary_metrics": summary_metrics,
+            "summary_tokens": summary_tokens,
+        }
+        if extra:
+            payload["extra"] = extra
+
+        out_path = os.path.join(output_dir, filename)
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        if getattr(accelerator, "wait_for_everyone", None):
+            accelerator.wait_for_everyone()
+        return out_path
+
+    if getattr(accelerator, "wait_for_everyone", None):
+        accelerator.wait_for_everyone()
+    return None
 
 
 @dataclass

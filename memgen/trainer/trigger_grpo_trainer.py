@@ -1,3 +1,13 @@
+# Disable vLLM in TRL if installed but incompatible (missing StatelessProcessGroup).
+try:
+    from vllm.distributed.utils import StatelessProcessGroup as _StatelessProcessGroup  # noqa: F401
+except Exception:
+    try:
+        import trl.import_utils as _trl_import_utils
+        _trl_import_utils._vllm_available = False
+    except Exception:
+        pass
+
 from trl import GRPOTrainer, GRPOConfig
 from trl.data_utils import maybe_apply_chat_template 
 from trl.models import unwrap_model_for_generation, create_reference_model   
@@ -320,13 +330,31 @@ class TriggerGRPOTrainer(GRPOTrainer):
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
         # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
-        is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
+        if rewards.numel() % self.num_generations == 0:
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
 
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            # Normalize the rewards to compute the advantages
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        else:
+            # Last batch may be smaller than num_generations; compute group stats using the true group sizes.
+            group_size = self.num_generations
+            num_samples = rewards.numel()
+            full_groups = num_samples // group_size
+            remainder = num_samples % group_size
+            group_sizes = [group_size] * full_groups + ([remainder] if remainder else [])
+
+            chunks = torch.split(rewards, group_sizes, dim=0)
+            mean_grouped_rewards = torch.stack([c.mean() for c in chunks], dim=0)
+            # Use unbiased=False to avoid NaN when a group has only 1 sample.
+            std_grouped_rewards = torch.stack([c.std(unbiased=False) for c in chunks], dim=0)
+
+            repeats = torch.tensor(group_sizes, device=rewards.device, dtype=torch.long)
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(repeats, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(repeats, dim=0)
+
+        is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
         advantages = rewards - mean_grouped_rewards
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
